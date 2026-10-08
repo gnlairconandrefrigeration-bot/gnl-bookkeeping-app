@@ -1,0 +1,111 @@
+const express = require('express');
+const { Pool } = require('pg');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Sales Invoice Creation Endpoint
+app.post('/api/sales', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const {
+      invoiceNumber, transactionDate, dueDate, customerName, customerTin,
+      description, vatClass, amountType, inputAmount, ewtRate, paymentStatus, paymentMethod, remarks
+    } = req.body;
+
+    const rawAmount = parseFloat(inputAmount);
+    let vatableSales = 0;
+    let outputVat = 0;
+    let grossAmount = 0;
+
+    if (vatClass === 'VATABLE') {
+      if (amountType === 'INCLUSIVE') {
+        grossAmount = rawAmount;
+        vatableSales = rawAmount / 1.12;
+        outputVat = grossAmount - vatableSales;
+      } else {
+        vatableSales = rawAmount;
+        outputVat = vatableSales * 0.12;
+        grossAmount = vatableSales + outputVat;
+      }
+    } else {
+      vatableSales = rawAmount;
+      outputVat = 0;
+      grossAmount = rawAmount;
+    }
+
+    const ewtAmount = vatableSales * (parseFloat(ewtRate || 0) / 100);
+    const netCollectible = grossAmount - ewtAmount;
+
+    const txRes = await client.query(
+      `INSERT INTO transactions (transaction_type, created_by) VALUES ('SALE', 'Admin') RETURNING transaction_id`
+    );
+    const transactionId = txRes.rows[0].transaction_id;
+
+    const invoiceRes = await client.query(
+      `INSERT INTO sales_invoices (
+        transaction_id, invoice_number, transaction_date, due_date, customer_name, customer_tin,
+        description, vat_class, amount_type, gross_amount, vatable_sales, output_vat,
+        ewt_amount, net_collectible, payment_status, payment_method, remarks
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [
+        transactionId, invoiceNumber, transactionDate, dueDate, customerName, customerTin,
+        description, vatClass, amountType, grossAmount.toFixed(2), vatableSales.toFixed(2),
+        outputVat.toFixed(2), ewtAmount.toFixed(2), netCollectible.toFixed(2),
+        paymentStatus, paymentMethod, remarks
+      ]
+    );
+
+    const isCash = paymentStatus === 'FULLY_PAID';
+    const debitAccountCode = isCash ? '1010' : '1020';
+    const debitAccountName = isCash ? 'Cash on Hand / Bank' : 'Accounts Receivable';
+
+    await client.query(
+      `INSERT INTO journal_entries (transaction_id, entry_date, account_code, account_name, debit, credit, description)
+       VALUES ($1, $2, $3, $4, $5, 0, $6)`,
+      [transactionId, transactionDate, debitAccountCode, debitAccountName, netCollectible.toFixed(2), `Invoice ${invoiceNumber}`]
+    );
+
+    if (ewtAmount > 0) {
+      await client.query(
+        `INSERT INTO journal_entries (transaction_id, entry_date, account_code, account_name, debit, credit, description)
+         VALUES ($1, $2, '1030', 'Creditable Withholding Tax', $3, 0, $4)`,
+        [transactionId, transactionDate, ewtAmount.toFixed(2), `EWT withheld for ${invoiceNumber}`]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO journal_entries (transaction_id, entry_date, account_code, account_name, debit, credit, description)
+       VALUES ($1, $2, '4010', 'Sales / Service Revenue', 0, $3, $4)`,
+      [transactionId, transactionDate, vatableSales.toFixed(2), `Sales Revenue - ${customerName}`]
+    );
+
+    if (outputVat > 0) {
+      await client.query(
+        `INSERT INTO journal_entries (transaction_id, entry_date, account_code, account_name, debit, credit, description)
+         VALUES ($1, $2, '2020', 'Output VAT Payable', 0, $3, $4)`,
+        [transactionId, transactionDate, outputVat.toFixed(2), `Output VAT 12% - ${invoiceNumber}`]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, invoice: invoiceRes.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
